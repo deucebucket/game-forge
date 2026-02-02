@@ -1,0 +1,24 @@
+# Secrets
+.env
+*.key
+secrets/
+
+# Generated assets (large files)
+assets/sprites/*.png
+assets/models/*.glb
+assets/models/*.fbx
+assets/models/*.obj
+
+# Godot
+.godot/
+*.import
+export_presets.cfg
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
