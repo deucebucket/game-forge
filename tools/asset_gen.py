@@ -166,6 +166,80 @@ def create_meshy_task(prompt: str, style: str = "low-poly") -> str:
     result = response.json()
     return result.get("result")
 
+def create_meshy_image_to_3d(image_path: str, prompt: str = None) -> str:
+    """Start a Meshy image-to-3D task using a reference image."""
+    import base64
+
+    api_key = get_meshy_key()
+    if not api_key:
+        raise Exception("Meshy API key not found")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    # Read and encode image as base64
+    with open(image_path, 'rb') as f:
+        image_data = base64.b64encode(f.read()).decode('utf-8')
+
+    # Determine mime type
+    ext = Path(image_path).suffix.lower()
+    mime = "image/png" if ext == ".png" else "image/jpeg"
+    data_uri = f"data:{mime};base64,{image_data}"
+
+    data = {
+        "image_url": data_uri,
+        "ai_model": "meshy-5",  # Latest stable model
+        "enable_pbr": True,  # Generate PBR textures
+        "topology": "triangle",
+        "target_polycount": 30000  # Good for games
+    }
+
+    response = requests.post(
+        f"{MESHY_API}/image-to-3d",
+        headers=headers,
+        json=data,
+        timeout=60
+    )
+
+    if response.status_code not in [200, 202]:
+        raise Exception(f"Meshy API error: {response.status_code} - {response.text}")
+
+    result = response.json()
+    return result.get("result")
+
+def wait_meshy_image_task(task_id: str, max_wait: int = 600) -> dict:
+    """Wait for Meshy image-to-3D task completion (takes longer than text-to-3D)."""
+    api_key = get_meshy_key()
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    start = time.time()
+    last_progress = -1
+
+    while time.time() - start < max_wait:
+        response = requests.get(
+            f"{MESHY_API}/image-to-3d/{task_id}",
+            headers=headers,
+            timeout=30
+        )
+        status = response.json()
+        state = status.get("status")
+        progress = status.get("progress", 0)
+
+        if progress != last_progress:
+            print(f"        Progress: {progress}%")
+            last_progress = progress
+
+        if state == "SUCCEEDED":
+            return status
+        elif state == "FAILED":
+            raise Exception(f"Generation failed: {status.get('task_error', {}).get('message', 'Unknown error')}")
+
+        time.sleep(10)
+
+    raise Exception("Timeout waiting for Meshy image-to-3D")
+
 def wait_meshy_task(task_id: str, max_wait: int = 300) -> dict:
     """Wait for Meshy task completion."""
     api_key = get_meshy_key()
@@ -204,8 +278,45 @@ def download_file(url: str, output_path: str) -> str:
         f.write(response.content)
     return output_path
 
-def generate_model(prompt: str, filename: str = None, style: str = "low-poly", format: str = "glb") -> str:
-    """Full pipeline: Meshy 3D generation."""
+def generate_reference_image(prompt: str, filename: str) -> str:
+    """Generate a clean reference image for 3D conversion via Gemini."""
+    SPRITES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Optimize prompt for 3D reference
+    enhanced = f"Create a reference image for 3D modeling: {prompt}. Front-facing view, centered, clean white or light gray background, full body visible, good lighting, no text or watermarks."
+
+    response = requests.post(
+        f"{GEMINI_API}/gemini/prompt",
+        json={"prompt": enhanced},
+        timeout=120
+    )
+
+    if response.status_code != 200:
+        raise Exception(f"Gemini API error: {response.text}")
+
+    result = response.json()
+    screenshot_path = result.get("screenshot")
+
+    # AI background removal for cleaner reference
+    from rembg import remove
+    from PIL import Image
+
+    with open(screenshot_path, 'rb') as f:
+        input_data = f.read()
+
+    output_data = remove(input_data)
+    img = Image.open(io.BytesIO(output_data))
+    if img.mode != 'RGBA':
+        img = img.convert('RGBA')
+
+    # Save reference image
+    ref_path = str(SPRITES_DIR / f"{filename}_reference.png")
+    img.save(ref_path, 'PNG')
+
+    return ref_path
+
+def generate_model(prompt: str, filename: str = None, style: str = "low-poly", format: str = "glb", use_reference: bool = True) -> str:
+    """Full pipeline: Generate reference with Gemini, then Meshy image-to-3D."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     if not filename:
@@ -214,19 +325,35 @@ def generate_model(prompt: str, filename: str = None, style: str = "low-poly", f
         filename = f"{safe_name}-{timestamp}"
 
     print(f"[MODEL] Generating: {prompt}")
-    print(f"        Style: {style}")
 
-    # Step 1: Start generation
-    print("  [1/3] Starting Meshy generation...")
-    task_id = create_meshy_task(prompt, style)
-    print(f"        Task ID: {task_id}")
+    if use_reference:
+        # Smart pipeline: Gemini reference -> Meshy image-to-3D
+        print("  [1/4] Generating reference image with Gemini...")
+        ref_path = generate_reference_image(prompt, filename)
+        print(f"        Reference: {ref_path}")
 
-    # Step 2: Wait for completion
-    print("  [2/3] Waiting for generation (~1-3 minutes)...")
-    result = wait_meshy_task(task_id)
+        print("  [2/4] Starting Meshy image-to-3D...")
+        task_id = create_meshy_image_to_3d(ref_path, prompt)
+        print(f"        Task ID: {task_id}")
 
-    # Step 3: Download
-    print("  [3/3] Downloading model...")
+        print("  [3/4] Waiting for 3D generation (~3-5 minutes)...")
+        result = wait_meshy_image_task(task_id)
+
+        step = "[4/4]"
+    else:
+        # Fallback: Text-to-3D only
+        print(f"        Style: {style}")
+        print("  [1/3] Starting Meshy text-to-3D...")
+        task_id = create_meshy_task(prompt, style)
+        print(f"        Task ID: {task_id}")
+
+        print("  [2/3] Waiting for generation (~1-3 minutes)...")
+        result = wait_meshy_task(task_id)
+
+        step = "[3/3]"
+
+    # Download model
+    print(f"  {step} Downloading model...")
     model_urls = result.get("model_urls", {})
     model_url = model_urls.get(format) or model_urls.get("glb")
 
@@ -236,14 +363,90 @@ def generate_model(prompt: str, filename: str = None, style: str = "low-poly", f
     output_path = str(MODELS_DIR / f"{filename}.{format}")
     download_file(model_url, output_path)
 
-    # Also get thumbnail
+    # Download thumbnail
     thumb_url = result.get("thumbnail_url")
     if thumb_url:
         thumb_path = str(MODELS_DIR / f"{filename}_preview.png")
         download_file(thumb_url, thumb_path)
         print(f"        Preview: {thumb_path}")
 
+    # Download PBR textures if available
+    texture_urls = result.get("texture_urls", [])
+    if texture_urls:
+        for i, tex_url in enumerate(texture_urls):
+            tex_path = str(MODELS_DIR / f"{filename}_texture_{i}.png")
+            download_file(tex_url, tex_path)
+        print(f"        Textures: {len(texture_urls)} downloaded")
+
     print(f"\n  Model saved: {output_path}")
+
+    return output_path
+
+# ============== TEXTURE GENERATION ==============
+
+def generate_texture(prompt: str, filename: str = None, tex_type: str = "diffuse",
+                    size: str = "512", tileable: bool = False) -> str:
+    """Generate game textures via Gemini."""
+    SPRITES_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not filename:
+        timestamp = int(time.time())
+        safe_name = prompt[:20].replace(" ", "-").replace("/", "-").lower()
+        filename = f"texture-{safe_name}-{timestamp}"
+
+    # Build texture-specific prompt
+    tile_hint = "seamless tileable pattern, edges match perfectly," if tileable else ""
+    type_hints = {
+        "diffuse": "color texture, base color map, albedo,",
+        "normal": "normal map, blue-purple tinted, bump detail, surface normals,",
+        "roughness": "roughness map, grayscale, white=rough black=smooth,",
+        "all": "PBR texture set preview showing diffuse normal and roughness,"
+    }
+
+    enhanced = f"Generate a {size}x{size} game texture: {type_hints.get(tex_type, '')} {tile_hint} {prompt}. Top-down view, flat, no perspective, suitable for 3D model UV mapping."
+
+    print(f"[TEXTURE] Generating: {prompt}")
+    print(f"          Type: {tex_type}, Size: {size}x{size}, Tileable: {tileable}")
+
+    # Generate with Gemini
+    print("  [1/2] Generating with Gemini...")
+    response = requests.post(
+        f"{GEMINI_API}/gemini/prompt",
+        json={"prompt": enhanced},
+        timeout=120
+    )
+
+    if response.status_code != 200:
+        raise Exception(f"Gemini API error: {response.text}")
+
+    result = response.json()
+    screenshot_path = result.get("screenshot")
+
+    # Process: crop to texture area and resize
+    print("  [2/2] Processing texture...")
+    from PIL import Image
+
+    img = Image.open(screenshot_path)
+
+    # Try to extract just the texture from the screenshot
+    # (Gemini screenshots include browser chrome)
+    # Crop to center region where texture likely is
+    w, h = img.size
+    # Assume texture is roughly centered
+    margin_x = int(w * 0.2)
+    margin_y = int(h * 0.15)
+    img = img.crop((margin_x, margin_y, w - margin_x, h - margin_y))
+
+    # Resize to requested size
+    target_size = int(size)
+    img = img.resize((target_size, target_size), Image.Resampling.LANCZOS)
+
+    # Save
+    output_path = str(SPRITES_DIR / f"{filename}_{tex_type}.png")
+    img.save(output_path, 'PNG')
+
+    print(f"\n  Texture saved: {output_path}")
+    print(f"  Size: {target_size}x{target_size}")
 
     return output_path
 
@@ -280,10 +483,25 @@ Examples:
     model_parser.add_argument("--filename", "-f", help="Output filename (no extension)")
     model_parser.add_argument("--style", "-s", default="low-poly",
                              choices=["realistic", "cartoon", "low-poly", "sculpture"],
-                             help="Art style")
+                             help="Art style (for text-to-3D fallback)")
     model_parser.add_argument("--format", default="glb",
                              choices=["glb", "fbx", "obj"],
                              help="Output format")
+    model_parser.add_argument("--no-reference", action="store_true",
+                             help="Skip Gemini reference image, use text-to-3D only")
+
+    # Texture command
+    texture_parser = subparsers.add_parser("texture", help="Generate texture/material")
+    texture_parser.add_argument("prompt", help="Description of the texture")
+    texture_parser.add_argument("--filename", "-f", help="Output filename")
+    texture_parser.add_argument("--type", "-t", default="diffuse",
+                               choices=["diffuse", "normal", "roughness", "all"],
+                               help="Texture type to generate")
+    texture_parser.add_argument("--size", default="512",
+                               choices=["256", "512", "1024", "2048"],
+                               help="Texture size (square)")
+    texture_parser.add_argument("--tileable", action="store_true",
+                               help="Make texture tileable/seamless")
 
     args = parser.parse_args()
 
@@ -299,7 +517,16 @@ Examples:
                 args.prompt,
                 filename=args.filename,
                 style=args.style,
-                format=args.format
+                format=args.format,
+                use_reference=not args.no_reference
+            )
+        elif args.command == "texture":
+            output = generate_texture(
+                args.prompt,
+                filename=args.filename,
+                tex_type=args.type,
+                size=args.size,
+                tileable=args.tileable
             )
 
         print(f"\nMEDIA: {output}")
